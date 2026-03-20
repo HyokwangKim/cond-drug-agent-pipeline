@@ -1,0 +1,18 @@
+# Environments
+venv/
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Data & Models (대용량 파일 업로드 방지)
+data/
+*.ckpt
+*.pt
+*.pth
+*.h5
+
+# OS generated files
+.DS_Store
