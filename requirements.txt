@@ -1,0 +1,14 @@
+# LLM & Agent Framework
+langchain
+langchain-google-genai
+langgraph
+langchain-community
+
+# Vector Database
+chromadb
+tiktoken
+
+# Data Validation & Utils
+pydantic
+python-dotenv
+pandas
