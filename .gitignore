@@ -13,6 +13,10 @@ data/
 *.pt
 *.pth
 *.h5
+*.csv
+*.gz
+*.zip
+chroma_db_real/
 
 # OS generated files
 .DS_Store

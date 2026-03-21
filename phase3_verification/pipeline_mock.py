@@ -1,95 +1,107 @@
-# phase3_verification/pipeline_mock.py
+import os
 import json
+import re
 from rdkit import Chem
 from rdkit.Chem import Descriptors
 
-# ---------------------------------------------------------
-# [Phase 1] 에이전트가 도출한 제약 조건 (이전 단계의 결과 모사)
-# ---------------------------------------------------------
-phase1_constraints = {
-    "max_molecular_weight": 500,
-    "avoid_substructures": ["beta-lactam ring"]
-}
-
-# ---------------------------------------------------------
-# [Phase 2] 더미 확산 모델 (Dummy Diffusion Model)
-# ---------------------------------------------------------
-def dummy_diffusion_model(constraints):
-    print("\n🚀 [Phase 2] 더미(Mock) 확산 모델 가동 중...")
-    print(" -> LDMol 모델이 제약 조건에 맞춰 분자를 생성하는 척합니다.")
-    
-    # 테스트를 위해 고의로 2개의 분자를 생성합니다.
-    # 1. 조건을 잘 지킨 안전한 분자 (예: Ibuprofen)
-    safe_molecule = "CC(C)CC1=CC=C(C=C1)C(C)C(=O)O"
-    
-    # 2. 고의로 'beta-lactam' 구조를 포함시킨 실패 유도 분자 (예: Ampicillin)
-    # 페니실린계 항생제로, 환자의 알레르기를 유발하는 구조입니다.
-    toxic_molecule = "CC1(C(N2C(S1)C(C2=O)NC(=O)C(C3=CC=CC=C3)N)C(=O)O)C"
-    
-    generated_candidates = [
-        {"name": "Candidate_A (Ibuprofen-like)", "smiles": safe_molecule},
-        {"name": "Candidate_B (Ampicillin-like)", "smiles": toxic_molecule}
+# --- 1. 더미 확산 모델 (Mock Diffusion Model) ---
+def mock_diffusion_generation():
+    """
+    Phase 2의 확산 모델이 생성했다고 가정하는 가상의 분자 리스트입니다.
+    의도적으로 합격할 물질과 불합격할 물질을 섞어두었습니다.
+    """
+    print("🤖 [Phase 2: Mock Diffusion] 가상의 분자 생성 중...")
+    return [
+        {"name": "Fasudil (목표 약물)", "smiles": "O=S(=O)(c1cccc2cnccc12)N3CCNCC3"},
+        {"name": "Losartan (ARB 계열 금기)", "smiles": "CCCCC1=NC(=C(N1CC2=CC=C(C=C2)C3=CC=CC=C3C4=NNN=N4)CO)Cl"},
+        {"name": "Aspirin (분자량 통과/작은 분자)", "smiles": "CC(=O)Oc1ccccc1C(=O)O"},
+        {"name": "Amoxicillin (Beta-lactam 금기)", "smiles": "CC1(C(N2C(S1)C(C2=O)NC(=O)C(C3=CC=C(C=C3)O)N)C(=O)O)C"},
+        {"name": "Heavy_Molecule (분자량 초과)", "smiles": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCC(=O)O"}
     ]
-    
-    return generated_candidates
 
-# ---------------------------------------------------------
-# [Phase 3] RDKit 기반 화학적 타당성 및 제약 조건 검증 (Verifier)
-# ---------------------------------------------------------
-# 자연어로 된 화학 구조 이름을 RDKit이 이해할 수 있는 SMARTS 패턴으로 매핑
-SMARTS_DICTIONARY = {
-    "beta-lactam ring": "C1CC(=O)N1"  # 4원환 락탐(Lactam) 구조
-}
-
-def verify_molecule_with_rdkit(smiles, constraints):
-    # 1. SMILES 문자열을 RDKit 분자 객체로 변환
-    mol = Chem.MolFromSmiles(smiles)
-    if not mol:
-        return False, "유효하지 않은 화학 구조 (SMILES 파싱 실패)"
-
-    # 2. 분자량(Molecular Weight) 검증
-    mw = Descriptors.MolWt(mol)
-    max_mw = constraints.get("max_molecular_weight", 1000)
-    if mw > max_mw:
-        return False, f"분자량 초과 (계산값: {mw:.2f} > 제한: {max_mw})"
-
-    # 3. 회피 구조(Avoid Substructures) 검증 (알레르기 필터링)
-    avoid_list = constraints.get("avoid_substructures", [])
-    for sub_name in avoid_list:
-        smarts_pattern = SMARTS_DICTIONARY.get(sub_name)
-        if smarts_pattern:
-            pattern_mol = Chem.MolFromSmarts(smarts_pattern)
-            # 분자 내에 해당 금지 구조가 포함되어 있는지 매칭 테스트 (SubstructMatch)
-            if mol.HasSubstructMatch(pattern_mol):
-                return False, f"환자 알레르기 유발 구조 발견 ({sub_name})"
-
-    return True, f"모든 제약 조건 통과 (분자량: {mw:.2f})"
-
-# ---------------------------------------------------------
-# 파이프라인 실행 메인 블록
-# ---------------------------------------------------------
-if __name__ == "__main__":
-    print("==================================================")
-    print(" 에이전트 기반 신약 후보 물질 생성 파이프라인 (통합 테스트)")
-    print("==================================================")
-    print(f"[입력된 제약 조건]:\n{json.dumps(phase1_constraints, indent=4)}\n")
-    
-    # 1. 가짜 모델을 통해 후보 물질 생성
-    candidates = dummy_diffusion_model(phase1_constraints)
-    
-    print("\n🔬 [Phase 3] RDKit 하이브리드 검증 시스템 가동...")
-    
-    # 2. 생성된 분자들을 하나씩 RDKit으로 깐깐하게 검증
-    for idx, candidate in enumerate(candidates, 1):
-        print(f"\n[{idx}번 후보 물질 검토]: {candidate['name']}")
-        print(f" - 구조식(SMILES): {candidate['smiles']}")
+# --- 2. 검증 에이전트 (Verification Agent) ---
+class StructuralVerifier:
+    def __init__(self, json_path):
+        if not os.path.exists(json_path):
+            raise FileNotFoundError(f"JSON 제약 조건 파일이 없습니다: {json_path}")
+            
+        with open(json_path, "r", encoding="utf-8") as f:
+            self.constraints = json.load(f)
+            
+        # 분자량 파싱
+        rules = self.constraints.get("physicochemical_rules", {})
+        mw_str = rules.get("molecular_weight", rules.get("MWT", rules.get("MW", "500")))
+        if isinstance(mw_str, str) and "-" in mw_str:
+            mw_str = mw_str.split("-")[1]
+        self.mw_limit = float(re.sub(r"[^\d.]", "", str(mw_str)))
         
-        # RDKit 검증 함수 호출
-        is_valid, reason = verify_molecule_with_rdkit(candidate['smiles'], phase1_constraints)
+        # 금기 구조 파싱 (custom_sampler의 로직 재사용)
+        self.excluded_smarts = []
+        raw_list = self.constraints.get("excluded_pharmacophores", [])
+        for item in raw_list:
+            match = re.search(r"\((?:SMILES|SMARTS):\s*([^)]+)\)", item, re.IGNORECASE)
+            pattern = match.group(1).strip() if match else item.strip()
+            mol = Chem.MolFromSmarts(pattern) or Chem.MolFromSmiles(pattern)
+            if mol: self.excluded_smarts.append((pattern, mol))
+
+    def verify(self, smiles):
+        """단일 SMILES에 대해 제약 조건 통과 여부를 검증합니다."""
+        mol = Chem.MolFromSmiles(smiles)
+        if not mol:
+            return False, "유효하지 않은 화학식"
+
+        # 1. 분자량 검증
+        mw = Descriptors.MolWt(mol)
+        if mw > self.mw_limit:
+            return False, f"분자량 초과 (제한: {self.mw_limit}, 실제: {mw:.1f})"
+
+        # 2. 금기 구조 검증
+        for pattern, smarts in self.excluded_smarts:
+            if mol.HasSubstructMatch(smarts):
+                return False, f"금기 구조 포함 적발 ({pattern})"
+
+        return True, "모든 제약 조건 통과 (PASS)"
+
+# --- 3. 파이프라인 통합 실행 ---
+def run_pipeline():
+    print("="*60)
+    print("💊 조건부 신약 후보 물질 생성 통합 파이프라인 검증 💊")
+    print("="*60)
+
+    json_path = "./data/clinical_constraints.json"
+    
+    try:
+        verifier = StructuralVerifier(json_path)
+        print(f"✅ Phase 1 제약 조건 로드 완료 (기준 분자량: {verifier.mw_limit})")
+    except Exception as e:
+        print(f"❌ 검증기 초기화 실패: {e}")
+        return
+
+    # Phase 2: 분자 생성
+    candidates = mock_diffusion_generation()
+    
+    print("\n🔬 [Phase 3: Hybrid Verification] 후보 물질 검증 시작...")
+    print("-" * 60)
+    
+    passed_candidates = []
+    
+    for candidate in candidates:
+        name = candidate['name']
+        smiles = candidate['smiles']
         
-        if is_valid:
-            print(f" -> ✅ [PASS] {reason}")
-            print(" -> [최종 결과]: 이 물질은 다음 단계(임상/합성)로 넘어갑니다.")
+        is_pass, reason = verifier.verify(smiles)
+        
+        if is_pass:
+            print(f"🟢 [PASS] {name}")
+            print(f"   - SMILES: {smiles}")
+            passed_candidates.append(candidate)
         else:
-            print(f" -> ❌ [REJECT] 사유: {reason}")
-            print(" -> [최종 결과]: 폐기 및 확산 모델에 재생성 요청 (Rejection Sampling)")
+            print(f"🔴 [REJECT] {name}")
+            print(f"   - 사유: {reason}")
+            
+    print("-" * 60)
+    print(f"🏆 최종 요약: 총 {len(candidates)}개 후보 중 {len(passed_candidates)}개 물질이 검증을 통과했습니다.")
+    print("="*60)
+
+if __name__ == "__main__":
+    run_pipeline()

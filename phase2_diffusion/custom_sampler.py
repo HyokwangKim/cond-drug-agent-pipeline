@@ -1,66 +1,117 @@
-# phase2_diffusion/custom_sampler.py
+import os
+import json
+import re
 import torch
+from rdkit import Chem
+from rdkit.Chem import Descriptors
 
-def training_free_guided_generation(
-    unet, 
-    scheduler, 
-    surrogate_model, 
-    text_embeddings, 
-    num_steps=50, 
-    guidance_scale=15.0, 
-    device="cpu"
-):
-    """
-    사전 학습된 Diffusion 모델을 파인튜닝 없이 제어하는 Custom Sampling Loop.
-    Tweedie's Formula와 Surrogate Model의 Gradient를 활용합니다.
-    """
-    print("\n🚀 [Phase 2] Training-Free Guidance 샘플링 시작...")
-    
-    # 1. 초기 노이즈(Latent Vector) 생성
-    batch_size = text_embeddings.shape[0]
-    in_channels = 4 # 임의의 채널 수 (실제 모델 구성에 따라 다름)
-    latents = torch.randn((batch_size, in_channels, 64, 64), device=device)
-    
-    scheduler.set_timesteps(num_steps)
-    
-    # 2. 역방향 확산(Reverse Diffusion) 루프
-    for i, t in enumerate(scheduler.timesteps):
-        # ★ 핵심: 역전파를 위해 latents의 gradient 추적 활성화
-        with torch.enable_grad():
-            latents = latents.detach().requires_grad_(True)
+class ConditionalGuidance:
+    CHEMICAL_DICT = {
+        "beta-lactam": "C1C(=O)NC1",
+        "sulfonamide": "S(=O)(=O)N",
+        "4-hydroxycoumarin": "c1ccccc1C2=C(O)C(=O)OC=C2",
+        "aniline": "c1ccccc1N",
+        "coumarin": "O=C1OC2=CC=CC=C2C=C1",
+        "penicillin": "CC1(C(N2C(S1)C(C2=O)NC(=O)CC3=CC=CC=C3)C(=O)O)C"
+    }
+
+    def __init__(self, json_path):
+        if not os.path.exists(json_path):
+            raise FileNotFoundError(f"❌ 파일을 찾을 수 없습니다: {json_path}")
             
-            # 스케줄러에 맞게 입력 스케일링
-            latent_model_input = scheduler.scale_model_input(latents, t)
+        with open(json_path, "r", encoding="utf-8") as f:
+            self.constraints = json.load(f)
             
-            # UNet 노이즈 예측 (텍스트 조건부)
-            noise_pred = unet(latent_model_input, t, encoder_hidden_states=text_embeddings)
-            
-            # Tweedie's Formula: 예측된 노이즈를 바탕으로 깨끗한 원본(x0_hat) 역산
-            alpha_prod_t = scheduler.alphas_cumprod[t]
-            beta_prod_t = 1 - alpha_prod_t
-            
-            x0_hat = (latents - (beta_prod_t ** 0.5) * noise_pred) / (alpha_prod_t ** 0.5)
-            
-            # Surrogate Model을 통한 물성 예측 (Phase 1의 JSON 조건이 여기 반영됨)
-            # 여기서는 예시로 대리 모델이 계산한 보상(Reward) 값을 가져온다고 가정
-            reward = surrogate_model(x0_hat)
-            
-            # 보상을 최대화하기 위해 Loss는 음수로 설정
-            loss = -1.0 * reward.sum()
-            
-            # x0_hat을 통과하여 현재 latents에 대한 그래디언트(방향) 계산
-            grad = torch.autograd.grad(outputs=loss, inputs=latents)[0]
-            
-        # 외부 그래디언트 주입을 통한 노이즈 방향 수정 (Guidance Scale 적용)
-        guided_noise_pred = noise_pred - (guidance_scale * torch.sqrt(beta_prod_t) * grad)
+        print(f"\n✅ 제약 조건 로드 완료: {json_path}")
         
-        # 수정된 노이즈로 다음 스텝 진행 (x_t -> x_t-1)
-        # torch.no_grad() 환경에서 업데이트를 수행해야 메모리 누수가 발생하지 않습니다.
-        with torch.no_grad():
-            latents = scheduler.step(guided_noise_pred, t, latents).prev_sample
+        rules = self.constraints.get("physicochemical_rules", {})
+        # MW, MWT, molecular_weight 등 다양한 키워드에 대응
+        mw_str = rules.get("molecular_weight", rules.get("MWT", rules.get("MW", "500")))
+        
+        # '300-550' 처럼 범위로 나올 경우 최댓값을 취함
+        if isinstance(mw_str, str) and "-" in mw_str:
+            mw_str = mw_str.split("-")[1]
             
-        if i % 10 == 0:
-            print(f"  -> Step {i}/{num_steps} 완료 (Gradient 주입됨)")
+        self.mw_limit = float(re.sub(r"[^\d.]", "", str(mw_str)))
+        print(f"   - 분자량 제한(MW Limit): {self.mw_limit}")
+        
+        self.excluded_smarts = []
+        raw_list = self.constraints.get("excluded_pharmacophores", [])
+        
+        print("🔍 화학 제약 조건 분석 및 매핑 중...")
+        for item in raw_list:
+            pattern = None
+            
+            # 1. 괄호 안의 코드 추출 시도 (예: "명칭 (SMILES: C1...)")
+            match = re.search(r"\((?:SMILES|SMARTS):\s*([^)]+)\)", item, re.IGNORECASE)
+            
+            if match:
+                pattern = match.group(1).strip()
+            else:
+                # 2. 괄호가 없다면, 문자열 자체가 코드인지 의심해봄
+                item_clean = item.strip()
+                # 공백이 없는 긴 문자열이라면 보통 SMILES 코드일 확률이 높음
+                if " " not in item_clean and len(item_clean) > 3:
+                    pattern = item_clean
+                else:
+                    # 3. 그것도 아니라면 사전에 있는지 확인
+                    pattern = self.CHEMICAL_DICT.get(item_clean.lower())
 
-    print("✅ 최적화된 분자 잠재 벡터(Latent Vector) 생성 완료!")
-    return latents
+            # 패턴이 존재하면 RDKit 객체화 시도
+            if pattern:
+                mol = Chem.MolFromSmarts(pattern) or Chem.MolFromSmiles(pattern)
+                if mol:
+                    self.excluded_smarts.append(mol)
+                    print(f"   ✅ 구조 등록 성공: {pattern}")
+                    continue
+            
+            print(f"   ⚠️ 무시됨 (코드 없음/해석 불가): '{item}'")
+
+        print(f"\n🚀 총 {len(self.excluded_smarts)}개의 제약 조건이 가이드에 반영되었습니다.")
+
+    def calculate_loss(self, smiles):
+        mol = Chem.MolFromSmiles(smiles)
+        if not mol: return 20.0
+        loss = 0.0
+        mw = Descriptors.MolWt(mol)
+        if mw > self.mw_limit:
+            loss += (mw - self.mw_limit) * 0.5
+        for smarts in self.excluded_smarts:
+            if mol.HasSubstructMatch(smarts):
+                loss += 10.0
+        return loss
+
+if __name__ == "__main__":
+    JSON_PATH = "./data/clinical_constraints.json"
+    try:
+        guidance = ConditionalGuidance(JSON_PATH)
+    except Exception as e:
+        print(f"❌ 에러: {e}")
+        
+    try:
+        guidance = ConditionalGuidance(JSON_PATH)
+        
+        print("\n" + "="*50)
+        print("🧪 [가상 약물 Loss 검증 테스트] 🧪")
+        print("="*50)
+
+        # 1. [Bad Drug] 로사르탄 (Losartan) 
+        # - ARB 계열 고혈압 약. (금기 구조인 Tetrazole 포함)
+        bad_smiles = "CCCCC1=NC(=C(N1CC2=CC=C(C=C2)C3=CC=CC=C3C4=NNN=N4)CO)Cl"
+        bad_loss = guidance.calculate_loss(bad_smiles)
+        print(f"🚫 [Losartan (ARB 계열)] Loss 점수: {bad_loss}")
+        if bad_loss >= 10.0:
+            print("   -> 훌륭합니다! 금기 구조를 정확히 적발하여 강력한 패널티를 부여했습니다.")
+
+        print("-" * 50)
+
+        # 2. [Good Drug] 파수딜 (Fasudil)
+        # - ROCK 저해제. (우리가 원하는 타겟, 금기 구조 없음)
+        good_smiles = "O=S(=O)(c1cccc2cnccc12)N3CCNCC3"
+        good_loss = guidance.calculate_loss(good_smiles)
+        print(f"✅ [Fasudil (ROCK 저해제)] Loss 점수: {good_loss}")
+        if good_loss == 0.0:
+            print("   -> 완벽합니다! 제약 조건을 모두 통과하여 패널티가 0입니다.")
+            
+    except Exception as e:
+        print(f"❌ 에러: {e}")
