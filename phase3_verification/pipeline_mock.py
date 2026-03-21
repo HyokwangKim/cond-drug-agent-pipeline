@@ -1,8 +1,17 @@
-import os
+from __future__ import annotations
+
 import json
+import logging
 import re
+from pathlib import Path
+from typing import Iterable, Mapping
+
 from rdkit import Chem
 from rdkit.Chem import Descriptors
+
+from cdp.io_trace import TraceEvent, write_trace_event
+
+logger = logging.getLogger(__name__)
 
 # --- 1. 더미 확산 모델 (Mock Diffusion Model) ---
 def mock_diffusion_generation():
@@ -21,11 +30,12 @@ def mock_diffusion_generation():
 
 # --- 2. 검증 에이전트 (Verification Agent) ---
 class StructuralVerifier:
-    def __init__(self, json_path):
-        if not os.path.exists(json_path):
-            raise FileNotFoundError(f"JSON 제약 조건 파일이 없습니다: {json_path}")
-            
-        with open(json_path, "r", encoding="utf-8") as f:
+    def __init__(self, json_path: str | Path) -> None:
+        path = Path(json_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"JSON 제약 조건 파일이 없습니다: {path}")
+
+        with path.open("r", encoding="utf-8") as f:
             self.constraints = json.load(f)
             
         # 분자량 파싱
@@ -44,7 +54,7 @@ class StructuralVerifier:
             mol = Chem.MolFromSmarts(pattern) or Chem.MolFromSmiles(pattern)
             if mol: self.excluded_smarts.append((pattern, mol))
 
-    def verify(self, smiles):
+    def verify(self, smiles: str) -> tuple[bool, str]:
         """단일 SMILES에 대해 제약 조건 통과 여부를 검증합니다."""
         mol = Chem.MolFromSmiles(smiles)
         if not mol:
@@ -62,46 +72,64 @@ class StructuralVerifier:
 
         return True, "모든 제약 조건 통과 (PASS)"
 
-# --- 3. 파이프라인 통합 실행 ---
-def run_pipeline():
-    print("="*60)
-    print("💊 조건부 신약 후보 물질 생성 통합 파이프라인 검증 💊")
-    print("="*60)
+def print_verification_report(
+    constraints_path: Path,
+    candidates: Iterable[Mapping[str, str]],
+) -> None:
+    """Phase 3: 제약 JSON과 후보 SMILES 목록에 대해 PASS/REJECT 로그를 출력합니다."""
+    verifier = StructuralVerifier(constraints_path)
+    logger.info("Phase3 loaded constraints MW_limit=%s", verifier.mw_limit)
+    print(f"✅ Phase 3: 제약 로드 (기준 분자량: {verifier.mw_limit})")
 
-    json_path = "./data/clinical_constraints.json"
-    
-    try:
-        verifier = StructuralVerifier(json_path)
-        print(f"✅ Phase 1 제약 조건 로드 완료 (기준 분자량: {verifier.mw_limit})")
-    except Exception as e:
-        print(f"❌ 검증기 초기화 실패: {e}")
-        return
-
-    # Phase 2: 분자 생성
-    candidates = mock_diffusion_generation()
-    
     print("\n🔬 [Phase 3: Hybrid Verification] 후보 물질 검증 시작...")
     print("-" * 60)
-    
-    passed_candidates = []
-    
-    for candidate in candidates:
-        name = candidate['name']
-        smiles = candidate['smiles']
-        
+
+    cand_list = list(candidates)
+    passed: list[Mapping[str, str]] = []
+    rejected: list[dict[str, str]] = []
+    for candidate in cand_list:
+        name = candidate["name"]
+        smiles = candidate["smiles"]
         is_pass, reason = verifier.verify(smiles)
-        
         if is_pass:
             print(f"🟢 [PASS] {name}")
             print(f"   - SMILES: {smiles}")
-            passed_candidates.append(candidate)
+            passed.append(candidate)
         else:
             print(f"🔴 [REJECT] {name}")
             print(f"   - 사유: {reason}")
-            
+            rejected.append({"name": name, "smiles": smiles, "reason": reason})
+
     print("-" * 60)
-    print(f"🏆 최종 요약: 총 {len(candidates)}개 후보 중 {len(passed_candidates)}개 물질이 검증을 통과했습니다.")
-    print("="*60)
+    print(f"🏆 최종 요약: 총 {len(cand_list)}개 후보 중 {len(passed)}개 물질이 검증을 통과했습니다.")
+    print("=" * 60)
+    trace_dir = constraints_path.resolve().parent / "runs" / "io_trace"
+    write_trace_event(
+        trace_dir=trace_dir,
+        event=TraceEvent(
+            phase="phase3",
+            stage="verification_output",
+            payload={
+                "constraints_path": str(constraints_path),
+                "candidate_count": len(cand_list),
+                "passed": list(passed),
+                "rejected": rejected,
+            },
+        ),
+        max_chars=500,
+    )
+
+
+# --- 3. 파이프라인 통합 실행 (레거시 단독 스크립트) ---
+def run_pipeline() -> None:
+    print("=" * 60)
+    print("💊 조건부 신약 후보 물질 생성 통합 파이프라인 검증 💊")
+    print("=" * 60)
+
+    root = Path(__file__).resolve().parents[1]
+    json_path = root / "data" / "clinical_constraints.json"
+    candidates = mock_diffusion_generation()
+    print_verification_report(json_path, candidates)
 
 if __name__ == "__main__":
     run_pipeline()

@@ -3,6 +3,7 @@ langchain
 langchain-google-genai
 langgraph
 langchain-community
+langchain-chroma
 
 # Vector Database
 chromadb
@@ -12,3 +13,9 @@ tiktoken
 pydantic
 python-dotenv
 pandas
+tqdm
+
+# Phase 2 (확산 가이던스; real 모드에서 lazy import)
+torch
+
+# 선택: pip install rdkit (Phase 2·3 화학 처리; README 참고)
